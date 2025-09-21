@@ -1,0 +1,9 @@
+# env + caches
+.env
+.env.*
+tarweej_env/
+venv/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
