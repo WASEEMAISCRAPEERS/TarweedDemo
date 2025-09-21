@@ -3,24 +3,12 @@ FastAPI app to serve Ultralytics YOLO model `terweejV1.pt` (default) for image i
 and a robust barcode-scanner endpoint `backImage` using pyzbar + OpenCV.
 
 Run:
-  uvicorn app:app --host 0.0.0.0 --port 8017 --reload
-
-Example (YOLO JSON):
-  curl -X POST "http://localhost:8017/predict?conf=0.25&iou=0.45&imgsz=640" \
-       -F "file=@/path/to/image.jpg"
-
-Example (YOLO annotated image):
-  curl -X POST "http://localhost:8017/predict_image?conf=0.25" \
-       -F "file=@/path/to/image.jpg" --output out.jpg
-
-Example (Barcode annotated image):
-  curl -X POST "http://localhost:8017/backImage?format=png&wrap=40" \
-       -F "file=@/path/to/barcode.png" --output barcode_result.png
+  uvicorn app:app --host 0.0.0.0 --port 8018 --reload
 
 Env vars (optional):
   MODEL_PATH=/absolute/or/relative/path/to/model.pt
   DEVICE=cpu  (or "mps" on Apple Silicon, or a CUDA index like "0")
-  APP_PORT=8017
+  APP_PORT=8018
   PRODUCTS_JSON=products.json
 
 Deps:
@@ -38,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, UploadFile, Query
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image
 import numpy as np
@@ -62,7 +51,17 @@ DEFAULT_MODEL_PATH = os.getenv("MODEL_PATH", "terweejV1.pt")
 DEFAULT_DEVICE = os.getenv("DEVICE", None)  # e.g., "cpu", "mps", "0"
 PRODUCTS_JSON_PATH = os.getenv("PRODUCTS_JSON", "products.json")
 
-app = FastAPI(title=APP_NAME, version="1.4.0")
+app = FastAPI(title=APP_NAME, version="1.5.0")
+
+# --- CORS: allow all origins/methods/headers and expose X-Barcodes ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # allow any origin
+    allow_credentials=False,      # keep False when using wildcard origins
+    allow_methods=["*"],          # allow all HTTP methods
+    allow_headers=["*"],          # allow all request headers
+    expose_headers=["X-Barcodes"] # make this readable by browsers
+)
 
 # --- Load model once at startup ---
 try:
@@ -361,13 +360,13 @@ async def backImage(
 
     # ROI tries for 1D barcodes
     for (x, y, w, h) in _roi_candidates(img0):
-        roi = img0[max(0,y-10):y+h+10, max(0,x-10):x+w+10]
+        roi = img0[max(0, y - 10):y + h + 10, max(0, x - 10):x + w + 10]
         for var in _preprocess_variants(roi):
             hits = _try_pyzbar(var)
             # Map ROI rect back to full image coords
             for det in hits:
                 r = det["rect"]
-                det["rect"] = {"x": r["x"] + max(0,x-10), "y": r["y"] + max(0,y-10), "w": r["w"], "h": r["h"]}
+                det["rect"] = {"x": r["x"] + max(0, x - 10), "y": r["y"] + max(0, y - 10), "w": r["w"], "h": r["h"]}
             found.extend(hits)
 
     found = _unique_by_data(found)
@@ -382,7 +381,7 @@ async def backImage(
                     bg_bgr=lbl_bgr, txt_bgr=txt_bgr, scale=0.6, thickness=2, pad=4)
         overlay = f"{det.get('data','')} | {PRODUCTS_DB.get(det.get('data',''), 'Not found in database')}"
         for i, line in enumerate(textwrap.wrap(overlay, width=wrap)):
-            cv2.putText(img, line, (max(10, x), y + h + 20 + i*22),
+            cv2.putText(img, line, (max(10, x), y + h + 20 + i * 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, txt_bgr, 2, cv2.LINE_AA)
 
     # Encode output
@@ -405,4 +404,3 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=APP_PORT, reload=True)
-
