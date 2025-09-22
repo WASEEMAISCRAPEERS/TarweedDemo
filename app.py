@@ -1,19 +1,24 @@
 """
-FastAPI app to serve Ultralytics YOLO model `terweejV1.pt` (default) for image inference
-and a robust barcode-scanner endpoint `backImage` using pyzbar + OpenCV.
+TARWEEJ | Image & Barcode Detection Service (FastAPI)
+
+- /predict         : YOLO detections as JSON
+- /predict_image   : YOLO annotated image
+- /backImage       : Barcode decode -> annotated image (green box, RED text)
+- /backImage_json  : Barcode decode -> JSON only (no image)
 
 Run:
   uvicorn app:app --host 0.0.0.0 --port 8018 --reload
 
 Env vars (optional):
-  MODEL_PATH=/absolute/or/relative/path/to/model.pt
-  DEVICE=cpu  (or "mps" on Apple Silicon, or a CUDA index like "0")
+  MODEL_PATH=/absolute/or/relative/path/to/model.pt   (default: tarweejV3.pt)
+  DEVICE=cpu | mps | "0"                              (CUDA index)
   APP_PORT=8018
-  PRODUCTS_JSON=products.json
+  PRODUCTS_JSON=/Users/koraspond_developer/Desktop/tarweej/products.json
 
 Deps:
   pip install ultralytics fastapi uvicorn pillow numpy opencv-python pyzbar python-dotenv
-  # macOS may need system lib: brew install zbar
+  # macOS needs system lib:
+  #   brew install zbar
 """
 
 from __future__ import annotations
@@ -24,19 +29,19 @@ import json
 import textwrap
 from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
+import numpy as np
+from PIL import Image
 from fastapi import FastAPI, File, UploadFile, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from PIL import Image
-import numpy as np
 
-# Ultralytics
+# YOLO (Ultralytics)
 from ultralytics import YOLO
 
-# Barcode libs
+# Barcode decoder
 from pyzbar.pyzbar import decode as zbar_decode
-import cv2
 
 # Optional .env
 try:
@@ -45,25 +50,28 @@ try:
 except Exception:
     pass
 
-APP_NAME = "tarweej-yolo-api"
+APP_NAME = "tarweej-yolo-barcode-api"
 APP_PORT = int(os.getenv("APP_PORT", 8018))
-DEFAULT_MODEL_PATH = os.getenv("MODEL_PATH", "terweejV1.pt")
+DEFAULT_MODEL_PATH = os.getenv("MODEL_PATH", "tarweejV3.pt")
 DEFAULT_DEVICE = os.getenv("DEVICE", None)  # e.g., "cpu", "mps", "0"
-PRODUCTS_JSON_PATH = os.getenv("PRODUCTS_JSON", "products.json")
-
-app = FastAPI(title=APP_NAME, version="1.5.0")
-
-# --- CORS: allow all origins/methods/headers and expose X-Barcodes ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],          # allow any origin
-    allow_credentials=False,      # keep False when using wildcard origins
-    allow_methods=["*"],          # allow all HTTP methods
-    allow_headers=["*"],          # allow all request headers
-    expose_headers=["X-Barcodes"] # make this readable by browsers
+PRODUCTS_JSON_PATH = os.getenv(
+    "PRODUCTS_JSON",
+    "/Users/koraspond_developer/Desktop/tarweej/products.json"
 )
 
-# --- Load model once at startup ---
+app = FastAPI(title=APP_NAME, version="2.1.0")
+
+# --- CORS: allow all & expose the X-Barcodes header ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Barcodes"],
+)
+
+# --- Load YOLO model once at startup ---
 try:
     yolo_model = YOLO(DEFAULT_MODEL_PATH)
     if DEFAULT_DEVICE:
@@ -74,17 +82,18 @@ except Exception as e:
 else:
     app.state.model_load_error = None
 
-# --- Load products DB once if available ---
+# --- Load products DB once ---
 if os.path.exists(PRODUCTS_JSON_PATH):
     try:
         with open(PRODUCTS_JSON_PATH, "r", encoding="utf-8") as f:
-            PRODUCTS_DB = json.load(f)
+            PRODUCTS_DB: Dict[str, str] = json.load(f)
     except Exception:
         PRODUCTS_DB = {}
 else:
     PRODUCTS_DB = {}
 
 
+# ---------------- Models ---------------- #
 class Detection(BaseModel):
     bbox: List[float]  # [x1, y1, x2, y2]
     conf: float
@@ -97,17 +106,35 @@ class PredictResponse(BaseModel):
     height: int
     detections: List[Detection]
 
+class BarcodeBox(BaseModel):
+    x: int
+    y: int
+    w: int
+    h: int
 
+class BarcodeDetection(BaseModel):
+    cls: str
+    data: str
+    product: Optional[str] = None
+    bbox: BarcodeBox
+
+class BarcodeResponse(BaseModel):
+    status: str
+    image_width: int
+    image_height: int
+    count: int
+    detections: List[BarcodeDetection]
+
+
+# ---------------- Helpers ---------------- #
 def _read_image_to_pil(upload: UploadFile) -> Image.Image:
     data = upload.file.read()
     return Image.open(io.BytesIO(data)).convert("RGB")
-
 
 def _result_to_json(result) -> Dict[str, Any]:
     boxes = result.boxes
     detections: List[Dict[str, Any]] = []
     names = getattr(result, "names", getattr(yolo_model, "names", {}))
-
     if boxes is not None and len(boxes) > 0:
         xyxy = boxes.xyxy.cpu().numpy()
         conf = boxes.conf.cpu().numpy()
@@ -121,10 +148,8 @@ def _result_to_json(result) -> Dict[str, Any]:
                 "cls": c,
                 "label": label,
             })
-
     h, w = result.orig_shape if hasattr(result, "orig_shape") else (None, None)
     return {"width": w, "height": h, "detections": detections}
-
 
 def _parse_bgr(csv: str, fallback: Tuple[int, int, int]) -> Tuple[int, int, int]:
     try:
@@ -134,16 +159,7 @@ def _parse_bgr(csv: str, fallback: Tuple[int, int, int]) -> Tuple[int, int, int]
         return fallback
 
 
-def _draw_label(img: np.ndarray, text: str, x: int, y: int,
-                bg_bgr: Tuple[int, int, int], txt_bgr: Tuple[int, int, int],
-                scale: float = 0.6, thickness: int = 2, pad: int = 4) -> None:
-    (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
-    top_left = (x, max(0, y - th - baseline - pad * 2))
-    bottom_right = (x + tw + pad * 2, y)
-    cv2.rectangle(img, top_left, bottom_right, bg_bgr, thickness=cv2.FILLED)
-    cv2.putText(img, text, (x + pad, y - baseline - pad), cv2.FONT_HERSHEY_SIMPLEX, scale, txt_bgr, thickness, cv2.LINE_AA)
-
-
+# ---------------- Health ---------------- #
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     return {
@@ -161,7 +177,7 @@ async def health() -> Dict[str, Any]:
 @app.post("/predict", response_model=PredictResponse)
 async def predict(
     file: UploadFile = File(...),
-    conf: float = Query(0.25, ge=0.0, le=1.0, description="Confidence threshold"),
+    conf: float = Query(0.30, ge=0.0, le=1.0, description="Confidence threshold"),
     iou: float = Query(0.45, ge=0.0, le=1.0, description="IoU threshold"),
     imgsz: int = Query(640, ge=64, le=4096, description="Inference image size"),
     device: Optional[str] = Query(None, description='Override device: "cpu", "mps", or CUDA index like "0"'),
@@ -185,7 +201,6 @@ async def predict(
     result = results[0]
     payload = _result_to_json(result)
     return PredictResponse(time_ms=elapsed_ms, **payload)
-
 
 @app.post("/predict_image")
 async def predict_image(
@@ -223,168 +238,89 @@ async def predict_image(
     return StreamingResponse(buf, media_type=mime)
 
 
-# ---------------- Barcode Utilities (Robust) ---------------- #
-
-def _unique_by_data(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    out = []
-    for it in items:
-        key = (it.get("class"), it.get("data"))
-        if key not in seen:
-            seen.add(key)
-            out.append(it)
-    return out
-
-
-def _try_pyzbar(img_bgr: np.ndarray) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    # Try color, gray, and binary
-    variants = [img_bgr]
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    variants.append(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))
-    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                cv2.THRESH_BINARY, 31, 5)
-    variants.append(cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR))
-    for v in variants:
-        for b in zbar_decode(v):
-            data = b.data.decode("utf-8", errors="ignore")
-            btype = b.type
-            x, y, w, h = b.rect
-            out.append({
-                "class": btype,
-                "data": data,
-                "rect": {"x": x, "y": y, "w": w, "h": h},
-                "source": "pyzbar",
-            })
-    return out
-
-
-def _try_opencv_qr(img_bgr: np.ndarray) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    try:
-        detector = cv2.QRCodeDetector()
-        data, points, _ = detector.detectAndDecode(img_bgr)
-        if data and points is not None and len(points) == 4:
-            xs = points[:, 0].astype(int)
-            ys = points[:, 1].astype(int)
-            x, y, w, h = int(xs.min()), int(ys.min()), int(xs.max()-xs.min()), int(ys.max()-ys.min())
-            out.append({
-                "class": "QRCODE",
-                "data": data,
-                "rect": {"x": x, "y": y, "w": w, "h": h},
-                "source": "opencv_qr",
-            })
-    except Exception:
-        pass
-    return out
-
-
-def _roi_candidates(img_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
-    """Heuristic ROI finder for 1D codes using gradients + morphology."""
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gradX = cv2.Sobel(gray, ddepth=cv2.CV_32F, dx=1, dy=0, ksize=-1)
-    gradY = cv2.Sobel(gray, ddepth=cv2.CV_32F, dx=0, dy=1, ksize=-1)
-    gradient = cv2.convertScaleAbs(cv2.subtract(gradX, gradY))
-    blurred = cv2.blur(gradient, (9, 9))
-    _, thresh = cv2.threshold(blurred, 225, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 7))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-    closed = cv2.erode(closed, None, iterations=4)
-    closed = cv2.dilate(closed, None, iterations=4)
-    cnts, _ = cv2.findContours(closed.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    rois: List[Tuple[int, int, int, int]] = []
-    for c in cnts:
-        x, y, w, h = cv2.boundingRect(c)
-        if w * h < 500:
-            continue
-        ar = w / float(h)
-        if ar < 1.5:
-            continue
-        rois.append((x, y, w, h))
-    return rois
-
-
-def _preprocess_variants(img_bgr: np.ndarray, upscale: int = 2) -> List[np.ndarray]:
-    variants: List[np.ndarray] = []
-    base = img_bgr.copy()
-    h, w = base.shape[:2]
-    variants.append(base)
-    if max(h, w) < 1500:
-        variants.append(cv2.resize(base, (w*upscale, h*upscale), interpolation=cv2.INTER_CUBIC))
-    gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    eq = clahe.apply(gray)
-    thr = cv2.adaptiveThreshold(eq, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY, 31, 5)
-    variants.append(cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR))
-    den = cv2.bilateralFilter(base, 5, 50, 50)
-    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    variants.append(cv2.filter2D(den, -1, kernel))
-    return variants
-
-
-def _rotations(img_bgr: np.ndarray) -> List[np.ndarray]:
-    rots = [img_bgr]
-    for k in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE]:
-        rots.append(cv2.rotate(img_bgr, k))
-    return rots
-
-
-# ---------------- Barcode Endpoint (Robust) ---------------- #
+# ---------------- Barcode Endpoints (pyzbar + OpenCV) ---------------- #
 @app.post("/backImage")
 async def backImage(
     file: UploadFile = File(...),
-    draw_color: str = Query("0,255,0", description="BGR rectangle color as 'B,G,R'"),
-    text_color: str = Query("255,255,255", description="BGR text color as 'B,G,R'"),
-    label_bg: str = Query("0,0,0", description="BGR filled background for class label"),
+    draw_color: str = Query("0,255,0", description="BGR rectangle color 'B,G,R' (default green)"),
+    text_color: str = Query("0,0,255", description="BGR text color 'B,G,R' (default red)"),
     wrap: int = Query(40, ge=10, le=120, description="Characters per wrapped text line"),
     format: str = Query("png", pattern="^(jpg|png)$", description="Output image format"),
 ):
-    """Decode barcodes robustly (multi-rotate + multi-preprocess + ROI), draw bounding box + CLASS NAME, overlay data/product, return annotated image."""
+    """
+    Barcode -> annotated image. Also returns detections in `X-Barcodes` header.
+    """
     raw = await file.read()
     np_arr = np.frombuffer(raw, np.uint8)
-    img0 = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    if img0 is None:
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img is None:
         return JSONResponse(status_code=400, content={"error": "Invalid image data"})
 
-    box_bgr = _parse_bgr(draw_color, (0, 255, 0))
-    txt_bgr = _parse_bgr(text_color, (255, 255, 255))
-    lbl_bgr = _parse_bgr(label_bg, (0, 0, 0))
+    box_bgr = _parse_bgr(draw_color, (0, 255, 0))   # green
+    txt_bgr = _parse_bgr(text_color, (0, 0, 255))   # red
 
+    barcodes = zbar_decode(img)
     found: List[Dict[str, Any]] = []
-    # Global tries
-    for rot in _rotations(img0):
-        for var in _preprocess_variants(rot):
-            found.extend(_try_pyzbar(var))
-            found.extend(_try_opencv_qr(var))
 
-    # ROI tries for 1D barcodes
-    for (x, y, w, h) in _roi_candidates(img0):
-        roi = img0[max(0, y - 10):y + h + 10, max(0, x - 10):x + w + 10]
-        for var in _preprocess_variants(roi):
-            hits = _try_pyzbar(var)
-            # Map ROI rect back to full image coords
-            for det in hits:
-                r = det["rect"]
-                det["rect"] = {"x": r["x"] + max(0, x - 10), "y": r["y"] + max(0, y - 10), "w": r["w"], "h": r["h"]}
-            found.extend(hits)
+    if barcodes:
+        for barcode in barcodes:
+            barcode_data = (barcode.data.decode("utf-8")).strip()
+            barcode_type = barcode.type
 
-    found = _unique_by_data(found)
+            # Lookup product in JSON database (exact key match)
+            product_info = PRODUCTS_DB.get(barcode_data, "Not found in database")
 
-    # Draw on original image
-    img = img0.copy()
-    for det in found:
-        r = det["rect"]
-        x, y, w, h = r["x"], r["y"], r["w"], r["h"]
-        cv2.rectangle(img, (x, y), (x + w, y + h), box_bgr, 2)
-        _draw_label(img, text=str(det.get("class", "BARCODE")), x=max(0, x), y=max(0, y),
-                    bg_bgr=lbl_bgr, txt_bgr=txt_bgr, scale=0.6, thickness=2, pad=4)
-        overlay = f"{det.get('data','')} | {PRODUCTS_DB.get(det.get('data',''), 'Not found in database')}"
-        for i, line in enumerate(textwrap.wrap(overlay, width=wrap)):
-            cv2.putText(img, line, (max(10, x), y + h + 20 + i * 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, txt_bgr, 2, cv2.LINE_AA)
+            # Draw rectangle around barcode
+            (x, y, w, h) = barcode.rect
+            cv2.rectangle(img, (x, y), (x + w, y + h), box_bgr, 2)
 
-    # Encode output
+            # Combine barcode + product info
+            overlay_text = f"{barcode_data} | {product_info}"
+
+            # Image center position
+            img_h, img_w = img.shape[:2]
+            y_offset = img_h // 2  # vertical center
+
+            for line in textwrap.wrap(overlay_text, width=wrap):
+                # Get text size (smaller font)
+                (text_w, text_h), baseline = cv2.getTextSize(
+                    line, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2
+                )
+
+                # Center horizontally in the image
+                text_x = (img_w // 2) - (text_w // 2)
+                text_y = y_offset
+
+                # Draw yellow background strip
+                cv2.rectangle(
+                    img,
+                    (text_x - 8, text_y - text_h - 8),
+                    (text_x + text_w + 8, text_y + baseline + 8),
+                    (0, 255, 255),  # Yellow BGR
+                    -1,
+                )
+
+                # Put text (black for contrast)
+                cv2.putText(
+                    img,
+                    line,
+                    (text_x, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,  # smaller font size
+                    (0, 0, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+                y_offset += text_h + 25  # line spacing
+
+            found.append({
+                "class": barcode_type,
+                "data": barcode_data,
+                "rect": {"x": x, "y": y, "w": w, "h": h},
+                "product": product_info,
+            })
+    # Encode output image
     ext = ".jpg" if format == "jpg" else ".png"
     ok, buf = cv2.imencode(ext, img)
     if not ok:
@@ -392,13 +328,63 @@ async def backImage(
 
     bytes_io = io.BytesIO(buf.tobytes())
     mime = "image/jpeg" if format == "jpg" else "image/png"
+
     headers = {"X-Barcodes": json.dumps(found, ensure_ascii=False)}
     return StreamingResponse(bytes_io, media_type=mime, headers=headers)
 
 
+@app.post("/backImage_json", response_model=BarcodeResponse)
+async def backImage_json(
+    file: UploadFile = File(...),
+) -> Any:
+    """
+    Barcode -> JSON only (no image). Returns class, data, product, and bbox.
+    """
+    raw = await file.read()
+    np_arr = np.frombuffer(raw, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid image data"})
+
+    H, W = img.shape[:2]
+
+    barcodes = zbar_decode(img)
+    detections: List[BarcodeDetection] = []
+
+    if barcodes:
+        for barcode in barcodes:
+            data = (barcode.data.decode("utf-8")).strip()
+            cls = barcode.type
+            x, y, w, h = barcode.rect
+            product = PRODUCTS_DB.get(data)
+
+            detections.append(
+                BarcodeDetection(
+                    cls=cls,
+                    data=data,
+                    product=product,
+                    bbox=BarcodeBox(x=x, y=y, w=w, h=h)
+                )
+            )
+
+    return BarcodeResponse(
+        status="success",
+        image_width=W,
+        image_height=H,
+        count=len(detections),
+        detections=detections
+    )
+
+
+# ---------------- Root ---------------- #
 @app.get("/")
 async def root():
-    return {"app": APP_NAME, "model": DEFAULT_MODEL_PATH, "port": APP_PORT}
+    return {
+        "app": APP_NAME,
+        "model": DEFAULT_MODEL_PATH,
+        "port": APP_PORT,
+        "products_json_path": PRODUCTS_JSON_PATH,
+    }
 
 
 if __name__ == "__main__":
