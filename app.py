@@ -174,7 +174,7 @@ async def health() -> Dict[str, Any]:
 
 
 # ---------------- YOLO Inference ---------------- #
-@app.post("/predict", response_model=PredictResponse)
+@app.post("process/front-image", response_model=PredictResponse)
 async def predict(
     file: UploadFile = File(...),
     conf: float = Query(0.30, ge=0.0, le=1.0, description="Confidence threshold"),
@@ -202,7 +202,7 @@ async def predict(
     payload = _result_to_json(result)
     return PredictResponse(time_ms=elapsed_ms, **payload)
 
-@app.post("/predict_image")
+@app.post("process/front-image/json")
 async def predict_image(
     file: UploadFile = File(...),
     conf: float = Query(0.25, ge=0.0, le=1.0),
@@ -239,7 +239,7 @@ async def predict_image(
 
 
 # ---------------- Barcode Endpoints (pyzbar + OpenCV) ---------------- #
-@app.post("/backImage")
+@app.post("process/back-image")
 async def backImage(
     file: UploadFile = File(...),
     draw_color: str = Query("0,255,0", description="BGR rectangle color 'B,G,R' (default green)"),
@@ -333,7 +333,7 @@ async def backImage(
     return StreamingResponse(bytes_io, media_type=mime, headers=headers)
 
 
-@app.post("/backImage_json", response_model=BarcodeResponse)
+@app.post("process/back-image-json", response_model=BarcodeResponse)
 async def backImage_json(
     file: UploadFile = File(...),
 ) -> Any:
